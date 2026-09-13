@@ -6,6 +6,8 @@ serves it through a fast lookup API — designed around the emergency
 dispatch use case (an ambulance transmits GPS coordinates and needs an
 immediate risk assessment for that location).
 
+![Risk Map](docs/map_preview.png)
+
 ## Problem
 
 Alexandria is a low-lying coastal city vulnerable to winter storm surges

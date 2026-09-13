@@ -18,49 +18,67 @@ request time is just a dictionary lookup by cell ID.
 
 ## Data
 
-- **Uber H3 hexagonal grid** (Resolution 7, ~5.16 km² per cell) covering a
-  manually defined coastal bounding box — **not** the OSM administrative
-  boundary for "Alexandria, Egypt", which returns the full governorate
-  extending ~137km south into the desert. The bounding box was chosen to
-  match the actual urban coastal strip.
+- **Uber H3 hexagonal grid** (Resolution 7, ~5.16 km² per cell), restricted
+  to land cells only, covering the coastal strip of Alexandria (107 cells).
 - **Elevation** for each cell centroid, from the free Open-Meteo Elevation
   API (Copernicus DEM GLO-90, 90m resolution), fetched in batches of 100
   points to respect the API's rate limits.
 - **94 real hospitals/clinics**, fetched from OpenStreetMap via OSMnx,
   reduced to centroids using a metric CRS (EPSG:32636).
+- **Natural Earth land polygons**, used to exclude sea cells from the grid
+  (see Methodology below).
 
 ## Methodology
 
-1. **Grid resolution trade-off**: started at H3 resolution 8 (~4,800
-   cells), which required ~49 batched API calls and repeatedly hit
-   Open-Meteo's per-minute and per-hour rate limits. Switched to
-   resolution 7 (~180 cells in the coastal bounding box) to keep the
-   pipeline reliably within free-tier API limits — a real constraint that
-   shaped the design, not an arbitrary choice.
-2. **Distance calculation**: nearest-hospital distance per cell computed
+1. **Coastal bounding box, not administrative boundary**: uses a manual
+   bounding box instead of OSM's boundary for "Alexandria, Egypt", which
+   returns the full governorate extending ~137km south into the desert.
+   The bounding box matches the actual urban coastal strip.
+
+2. **Grid resolution trade-off**: started at H3 resolution 8 (~4,800
+   cells), which required ~49 batched Open-Meteo API calls and repeatedly
+   hit rate limits. Switched to resolution 7 to keep the pipeline reliably
+   within free-tier limits.
+
+3. **Land-only grid (an issue discovered during review)**: a rectangular
+   bounding box over a coastal city inevitably includes open sea to the
+   northwest. An earlier version of this project did not filter these
+   out, which produced hexagons sitting entirely in the Mediterranean
+   that were scored as flood-risk zones — a meaningless result, since
+   there's no land there to flood. This was caught by visually inspecting
+   the result map (colored dots appeared offshore in open water). A first
+   fix attempt tried to build a land polygon from OSM's raw coastline
+   data, but the crowd-sourced coastline segments had gaps and couldn't
+   be merged into one continuous line. The working fix instead clips
+   against Natural Earth's authoritative land dataset and keeps only H3
+   cells whose centroid falls on land — reducing the grid from 184 to
+   107 cells.
+
+4. **Distance calculation**: nearest-hospital distance per cell computed
    in PostGIS using `ST_Distance` after projecting to EPSG:32636 (UTM
-   Zone 36N), the same approach used in the companion Cairo project.
-3. **Composite vulnerability score**: originally modeled as
+   Zone 36N).
+
+5. **Composite vulnerability score**: originally modeled as
    `0.7 × elevation_risk + 0.3 × distance_risk` with fixed thresholds
    (0m/15m for elevation, 5000m for distance). This produced a degenerate
-   result — 168 of 184 cells classified "High" — because 84% of the
-   coastal strip sits at or below sea level, so a fixed 0m/15m cutoff
-   couldn't discriminate between cells. The fix: both factors are now
-   **min-max normalized against the actual data distribution** (same
-   normalization approach as the Cairo project) rather than using
-   externally-assumed thresholds, and the weighting was rebalanced to
-   50/50 since elevation carries much less discriminating power in this
-   flat coastal city than it would elsewhere.
-4. **Result**: a more meaningful spread — 87 High, 92 Medium, 5 Low —
-   driven primarily by distance to the nearest hospital, which is the
-   factor that actually varies meaningfully across this terrain.
+   result — most cells classified "High" — because the vast majority of
+   the coastal strip sits at or below sea level, so a fixed 0m/15m cutoff
+   couldn't discriminate between cells. The fix: both factors are min-max
+   normalized against the actual (land-only) data distribution rather
+   than using externally-assumed thresholds, and the weighting was
+   rebalanced to 50/50 since elevation carries much less discriminating
+   power in this flat coastal city than a generic 70/30 split would
+   assume.
 
 ## Architecture
 
 ```
-OpenStreetMap (OSMnx)          Open-Meteo Elevation API
-   │ hospitals                     │ elevation per cell
-   ▼                               ▼
+OpenStreetMap (OSMnx)      Open-Meteo Elevation API      Natural Earth
+   │ hospitals                 │ elevation per cell         │ land polygons
+   ▼                           ▼                            ▼
+                    H3 grid generation (land-only cells)
+                                │
+                                ▼
         PostGIS (PostgreSQL)
    - hex_grid, hospitals, hex_distances (ST_Distance in EPSG:32636)
                 │
@@ -92,10 +110,10 @@ GET /api/v1/flood-safety/{h3_index}
 Example response:
 ```json
 {
-  "h3_index": "873f5bb29ffffff",
-  "elevation_m": 0,
-  "dist_to_hospital_m": 16482.54,
-  "vulnerability_score": 94.59,
+  "h3_index": "873e66d13ffffff",
+  "elevation_m": -1.0,
+  "dist_to_hospital_m": 15236.55,
+  "vulnerability_score": 95.95,
   "risk_category": "High"
 }
 ```
@@ -106,17 +124,23 @@ Example response:
 pip install -r requirements.txt
 ```
 
-Run the data pipeline notebook/scripts to generate the grid, fetch
-elevation and hospital data, compute distances in PostGIS, and export
-`alexandria_risk_scores.csv`. Then start the API:
+Create a `.env` file (see `.env.example`) with your PostgreSQL credentials,
+then create the `alexandria_gis` database with the PostGIS extension
+enabled:
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+```
 
+Run the pipeline scripts in order:
 ```bash
-python -m uvicorn alexandria_api:app --reload
+python scripts/generate_alexandria_h3_grid.py
+python scripts/build_alexandria_risk_dataset.py
+python -m uvicorn scripts.alexandria_emergency_api:app --reload
 ```
 
 ## Known Limitations
 
-- Elevation is a static snapshot (Copernicus DEM, 90m resolution) — it's a
+- Elevation is a static snapshot (Copernicus DEM, 90m resolution) — a
   reasonable proxy for relative flood susceptibility, not a real-time or
   high-precision flood model.
 - No historical flood event data was available for validation; the risk
@@ -124,6 +148,9 @@ python -m uvicorn alexandria_api:app --reload
   a calibrated hydrological model.
 - Hospital data reflects what's tagged in OpenStreetMap at the time of
   fetching, which may miss some smaller clinics.
+- The land/sea filter uses cell-centroid containment, so a hexagon whose
+  centroid is on land but which partially overlaps water (or vice versa)
+  is not split at the coastline.
 
 ## Tech Stack
 

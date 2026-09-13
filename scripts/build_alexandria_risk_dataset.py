@@ -4,8 +4,10 @@ build_alexandria_risk_dataset.py
 Fetches elevation and hospital data, computes distances in PostGIS, and
 builds the composite flood vulnerability score for every H3 cell.
 
-Prerequisite: run generate_alexandria_h3_grid.py first, and create the
-`alexandria_gis` PostGIS database with the postgis extension enabled:
+Prerequisite: run generate_alexandria_h3_grid.py first (produces a
+land-only grid - see that script for why sea cells are excluded), and
+create the `alexandria_gis` PostGIS database with the postgis extension
+enabled:
     CREATE EXTENSION IF NOT EXISTS postgis;
 """
 
@@ -142,6 +144,10 @@ def compute_vulnerability_score(df_risk):
     actual data distribution instead, and rebalancing weights to 50/50
     since elevation carries much less discriminating power here than a
     generic 70/30 split would assume.
+
+    Note: this normalization is computed AFTER the grid was restricted to
+    land-only cells (see generate_alexandria_h3_grid.py). Sea cells would
+    otherwise pull the min/max range in a meaningless direction.
     """
     df_risk["elevation_risk"] = 1 - MinMaxScaler().fit_transform(df_risk[["elevation_m"]])
     df_risk["distance_risk"] = MinMaxScaler().fit_transform(df_risk[["dist_to_hospital_m"]])
